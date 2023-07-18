@@ -1,6 +1,6 @@
 {application, msg_batcher,
  [{description, "An OTP application"},
-  {vsn, "0.1.0"},
+  {vsn, "git"},
   {registered, []},
   {mod, {msg_batcher_app, []}},
   {applications,
