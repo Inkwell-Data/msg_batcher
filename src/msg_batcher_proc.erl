@@ -89,7 +89,8 @@ init({TabName, BhvMod, InitArgs, #{
             batch_time := BatchTime
        } = Opts}) ->
     _ = erlang:process_flag(trap_exit, true),
-    Tab = ets:new(TabName, [ordered_set, public, {write_concurrency, true}]),
+    %% Tab = ets:new(TabName, [ordered_set, public, {write_concurrency, true}]),
+    {ok, Tab} = dets:open_file(TabName, [{type, set}, {auto_save, 60000}]),
     CRef = counters:new(?CINDEX_MAX, [write_concurrency]),
     TRef = send_flush_after(BatchTime),
     DropFactor = maps:get(drop_factor, Opts, ?DROP_FACTOR),
@@ -108,11 +109,13 @@ init({TabName, BhvMod, InitArgs, #{
              counter_ref => CRef, timer_ref => TRef},
     case BhvMod of
         undefined ->
-            {ok, Data#{batch_callback => maps:get(batch_callback, Opts),
-                       batch_callback_state => maps:get(batch_callback_state, Opts, no_state)}};
+            {ok, Data#{tab_name => TabName, 
+                        batch_callback => maps:get(batch_callback, Opts),
+                        batch_callback_state => maps:get(batch_callback_state, Opts, no_state)}};
         _ ->
             handle_return(BhvMod:init(InitArgs),
-                Data#{batch_callback => {BhvMod, handle_batch, []}})
+                Data#{ tab_name => TabName,
+                    batch_callback => {BhvMod, handle_batch, []}})
     end.
 
 handle_call(_Request, _From, #{behaviour_module := undefined} = Data) ->
@@ -152,9 +155,12 @@ handle_info(Info, #{behaviour_module := Mod, batch_callback_state := CallbackSta
     ?IF_EXPORTED(Mod, handle_info, 2,
         handle_return(Mod:handle_info(Info, CallbackState), Data), {noreply, Data}).
 
-terminate(Reason, #{behaviour_module := Mod, batch_callback_state := CallbackState}) ->
+terminate(Reason, #{behaviour_module := Mod, batch_callback_state := CallbackState, tab_name := TabName} = _State) ->
     %% TODO: we need a monitor process to won the ETS table, and flush the msgs
     %%   inserted after the batcher_proc is terminated.
+    % io:format("[~p] terminate ~p~n", [?MODULE, State]),
+    dets:close(TabName),
+    file:delete(TabName),
     msg_batcher_object:delete(self()),
     ?IF_EXPORTED(Mod, terminate, 2,
         Mod:terminate(Reason, CallbackState), ok).
@@ -216,7 +222,7 @@ handle_return({error, Reason}, _Data) ->
 %% =============================================================================
 
 ensure_msg_queued(Tab, Msg, StoreFormat, CRef) ->
-    case ets:insert_new(Tab, buffer_record(Msg, StoreFormat)) of
+    case dets:insert_new(Tab, buffer_record(Msg, StoreFormat)) of
         true -> incr_queue_size(CRef);
         false ->
             %% the msg_ts() does not garantee an unique timestamp if called in parallel
@@ -277,7 +283,7 @@ do_flush(_Tab, _BatchSize, _Callback, CallbackState, _CRef, _DropFactor,
     {CntAcc, DropAcc, CallbackState};
 do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
         StoreFormat, CntAcc, DropAcc, Retry) ->
-    case ets:first(Tab) of
+    case dets:first(Tab) of
         '$end_of_table' ->
             {CntAcc, DropAcc, CallbackState};
         FirstKey ->
@@ -305,7 +311,7 @@ do_flush(Tab, BatchSize, Callback, CallbackState, CRef, DropFactor,
 take_first_n_msg(_Tab, _Key, _, N, MsgAcc) when N =< 0 ->
     lists:reverse(MsgAcc);
 take_first_n_msg(Tab, Key, StoreFormat, N, MsgAcc) ->
-    case ets:next(Tab, Key) of
+    case dets:next(Tab, Key) of
         '$end_of_table' ->
             lists:reverse(MsgAcc);
         NextKey ->
@@ -314,9 +320,15 @@ take_first_n_msg(Tab, Key, StoreFormat, N, MsgAcc) ->
 
 fetch_msg(Tab, Key, StoreFormat) ->
     %% read value of Key from ets table, and then delete it
-    case ets:take(Tab, Key) of
+    %% case ets:take(Tab, Key) of
+    %%     [] -> throw({key_not_found, Key});
+    %%     [{_, Msg}] -> maybe_decode_msg(Msg, StoreFormat)
+    %% end.
+    case dets:lookup(Tab, Key) of
         [] -> throw({key_not_found, Key});
-        [{_, Msg}] -> maybe_decode_msg(Msg, StoreFormat)
+        [{_, Msg}] ->
+            dets:delete(Tab, Key), 
+            maybe_decode_msg(Msg, StoreFormat)
     end.
 
 call_handle_batch({M, F, A}, no_state, BatchMsgs) ->
